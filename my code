@@ -1,0 +1,426 @@
+from scipy.integrate import solve_ivp
+#import matplotlib.pyplot as plt
+import numpy as np
+from multiprocessing import Pool
+from numpy import zeros
+from scipy.special import spherical_jn
+from scipy.integrate import quad
+import h5py
+from scipy.special import spherical_jn
+from scipy.integrate import simpson
+
+# Constants and parameters
+H0 = 67.8
+
+n = 0.96     #0.96
+
+w_m = 0
+c = 3e5
+
+#k= 1 
+#l = ( k*c) / H0
+
+Csx = 1
+DH = 1.9e-5                  #5.6 * 1e-5 
+Cax = 0
+
+# values of h = H/H0 and Omega_m @a=1
+h_0 = 1.0   
+Omega_m0 = 0.3  
+Omega_x0 = 0.7  
+a0 = 1
+ai = 1e-3
+
+ks = np.linspace(1e-4,1,1000)
+# the RP potential
+#alpha =  0.5      #  for 0.5  0.571773  for 0.3 0.535511    for 0.1 0.509840   for 0 0.499997 
+A0 =    1.632099   #0.327610
+
+#alpha_list = [0.5,0.619347,0.773002,0.9297331]
+#etha = [0,0.1,0.3,0.5]
+A1 =     1.3577635000
+# alpha1 = 0.4400000000
+
+# Gamma =   0.5101      
+# beta =  1.954       
+# alpha2 =        -6.25218000                              
+A2 = 0.65347040                             
+
+# integration interval
+a1 = np.linspace(1,1e-3,5000) # from a=1 to a=1e-3
+a = np.linspace(1e-3,a0,5000)#a0[::-1] # from a=1e-3 to a=1
+#models = "LCDM"
+Model = "LCDM"  #["LCDM","RP","SUGRA","DEXP"]
+#etha = 0     #[0,0.1,0.3,0.5]
+ell = np.linspace(1, 200, 10)  # 10 ,20
+zs_list = [0, 0.5, 1, 3, 4]
+etha_list = [0, 0.1, 0.3, 0.5]
+#The Cell fuctions
+bi_M = 1 # magnification bias
+bi_g = 1 # galaxy bias
+
+
+def U_RP(x, n, alpha):
+    U0 = A0 / x**alpha
+    if n == 0:
+        return U0
+    elif n == 1:
+        return -alpha * (U0 / x)
+    else:
+        raise ValueError("Unsupported n value")
+def U_SUGRA(x, n):
+    U0 = (A1 / x**alpha1) * np.exp((1/2)*x**2)
+    if n == 0:
+        return U0 
+    elif n == 1:
+        return   U0*(x -(alpha1/x) )                 #-alpha1 * (U0 / x) + (x * U0)
+    elif n == 2:
+        return -alpha1 * (alpha1 + 1) * (U0 / x**2) - alpha1 * U0 + (1 - alpha1) * U0 + x**2 * U0
+    else:
+        raise ValueError("U(x) expected 'n' to be 0, 1, or 2")
+
+def U_DExp(x, n):
+     U0 = A2*(np.exp(alpha2 * x) + Gamma* np.exp(beta * x))
+     if n == 0:
+         return U0 
+     elif n == 1:
+         return A2*(alpha2 * np.exp(alpha2 * x) + Gamma *beta* np.exp(beta * x)) 
+     elif n == 2:
+         return A2* (alpha2**2 * np.exp(alpha2 * x) + Gamma * beta**2 * np.exp(beta * x))
+     else:
+         raise ValueError("U(x) expected 'n' to be 0, 1, or 2")
+
+def U(x, n, model, alpha):
+    if model == "LCDM":
+        return 0
+    elif model == "RP":
+        return U_RP(x, n, alpha)
+    elif model == "SUGRA":
+        return U_SUGRA(x, n)
+    elif model == "DExp":
+        return U_DExp(x, n)
+    else:
+        raise ValueError("U(x) expected 'n' to be 0, 1, or 2")
+
+def w_q(a, x, y, model, alpha):
+    return (y**2 - 2 * a**2 * U(x, 0, Model, alpha)) / (y**2 + 2 * a**2 * U(x, 0, Model, alpha))
+def dphi (a,h,x,y,Omega_m,Omega_x,phi,Ux,Um,alpha,model):
+    w_x = w_q(a, x, y, Model,alpha)
+    dphida = -(phi / a) - (3 /2) * h * (Omega_m * Um + Omega_x * (1 + w_x) * Ux)
+    return dphida
+
+def dpsidt (a,h,x,y,Omega_m,Omega_x,phi,Ux,Um):
+    return a*h*dphi(a, h, x, y, Omega_m, Omega_x, phi, Ux, Um)
+
+
+def u_total(a,h,x,y,Omega_m,Omega_x,Um,Ux,alpha,model):
+    w_x = w_q(a, x, y, Model, alpha)
+    u = ((Omega_m*Um+Omega_x*Ux)/(1+ Omega_x*w_x))
+    return u
+
+
+def Q_x(a, h, x, y, Omega_m, Omega_x,Ux,Um,Dx,phi,k,etha,alpha, n,model):
+    wx = w_q(a, x, y, Model,alpha)
+    Qx = etha * h*(1 + wx)
+    l = (k * c) / H0
+
+    #(ux,um==0,use_u==False)
+    if n == 0:
+        return Qx
+    elif n == 1:
+        wx = w_q(a, x, y, Model, alpha)
+        duxda = -(Ux / a) - (1/ (1 + wx)) * (Dx / (a**2 * h)) - (phi / (a**2 * h))
+        u = u_total(Omega_m, Omega_x, a, Um, Ux, x, y,Model)
+        dy_da = -2* ( y)/a - U(x, 1, Model,alpha)/h + Qx*Omega_x*((3*a*h)/y)
+        ena = (-a**2*h*Ux*(dy_da/y)) - a**2*h*duxda
+        dphida = dphi(a, h, x, y, Omega_m, Omega_x, phi, Ux, Um, alpha, model)
+        
+        return Qx* (ena - phi - a * dphida - ((l**2 *u) / (3 * a * h)))
+    else:
+        raise ValueError("Invalid value for n in Q_x")
+
+        
+def w_xeff(a,h,x,y,etha,n,model,alpha):
+    wx = w_q(a, x, y, Model,alpha)  # Get the actual equation of state
+    
+    if n == 0:
+        return wx
+    elif n == 1:
+        Qx  = etha * h*(1 +wx)
+        return wx - (Qx / (3 * h))
+    else:
+        raise ValueError("Invalid value for n in w_xeff")
+    
+def w_meff(a,h,x,y,Omega_m, Omega_x,etha,alpha,n,model):
+    wx = w_q(a, x, y, Model,alpha)
+    wm =0
+    if n==0:
+        return wm
+    elif n==1:
+        Qx  = etha * h*(1 + wx)
+        Qm = -(Omega_x/Omega_m)*Qx
+        return wm - Qm/3/h
+    
+def dQxda(a, h,x,y,Omega_x,Omega_m,etha,alpha,model):
+    wx =w_q(a, x, y, Model,alpha)
+    wm = 0
+    w = wx *Omega_x + wm *Omega_m
+    Qx = etha * h*(1 + wx)
+    weff = w_xeff(a, h, x, y, etha, 1, Model)
+    dy_da = -2* ( y)/a - U(x, 1, Model,alpha)/h + Qx*Omega_x*((3*a*h)/y) 
+    return (-3/2) * a * h**2 * (2*weff + 6 + wx * Omega_x)
+
+
+def background(a,z,k):
+    h, Omega_m, Omega_x = z
+    w_x = -1
+    w = Omega_m*w_m + Omega_x*w_x
+    dh_da = -(3/2) * (h/a) * (1+w)
+    dOmega_m_da = -(3/a) * (w_m - w) * Omega_m
+    dOmega_x_da = -(3/a) * (w_x-w) * Omega_x
+    #dOmega_x_da = -dOmega_m_da
+    return np.array([dh_da, dOmega_m_da, dOmega_x_da])
+
+def ODEs( k, etha, alpha, model):
+        
+    def LCDM(a,z):
+        h, Omega_m, Omega_x,phi,Dm,Um = z
+        l = ( k*c) / H0
+        w_x = -1
+        w = Omega_m*w_m + Omega_x*w_x
+        dh_da = -(3/2) * (h/a) * (1+w)
+        dOmega_m_da = -(3/a) * (w_m-w) * Omega_m
+        dOmega_x_da = -(3/a) * (w_x-w) * Omega_x
+        #dOmega_x_da = -dOmega_m_da
+        dUmda = -(Um / a) - (phi/(a**2 * h))                        # u_m = H0*Vm
+        dDmda = (9 / 2) * h * Omega_x * (1 + w_x) * (Um) + ((l**2 * Um) / (a**2 * h))
+        dphida = -(phi / a) - (3 /2) * h * (Omega_m * Um )
+        
+        return np.array([dh_da, dOmega_m_da, dOmega_x_da,dphida,dDmda,dUmda])
+    
+    
+    # Combined ODEs for background and perturbations
+    def QCDM(a,z):
+        h, Omega_m, Omega_x, y, x,phi,Dm,Um,Dx,Ux = z
+
+        w_x = w_q(a, x, y, Model,alpha)                         
+        w = w_m  * Omega_m + w_x  * Omega_x  # Total equation of state
+        l = (k * c) / H0
+        wxeff = w_xeff(a, h, x, y, etha, 1, model, alpha)
+        #wmeff = w_meff(a, h, x, y, Omega_m, Omega_x, etha, 1, model)
+        Qx0 = Q_x(a, h, x, y, Omega_m, Omega_x, Ux, Um, Dx, phi, k, etha, alpha, 0, model)
+        Qm0 = -(Omega_x/Omega_m)*Qx0
+        Qx1 = Q_x(a, h, x, y, Omega_m, Omega_x, Ux, Um, Dx, phi, k, etha, alpha, 1, model)
+        Qm1 = -(Omega_x/Omega_m)*Qx1
+        dQ_xda = dQxda(a, h, x, y, Omega_x, Omega_m, etha, alpha, model)
+        dQ_mda = -(Omega_x/Omega_m)*dQ_xda
+        dh_da = -(3/2) * (h/a) * (1 + w)
+        domega_x_da = -(3/a) * (wxeff - w) * Omega_x 
+        domega_m_da = -domega_x_da
+
+        
+        dy_da = -2* ( y)/a - U(x,1,Model,alpha)/h + ((Qx0*Omega_x*3*a*h)/y)
+        dx_da = y / (a**2 * h)
+        
+        
+        # Perturbations ODEs
+        dphida = dphi(a, h, x, y, Omega_m, Omega_x, phi, Ux, Um, alpha, model)
+        
+        dumda = -(Um / a) - (phi/(a**2 * h)) -(Qm0/(a*h))*(Um - Ux)
+        duxda = -(Ux / a) - (Csx / (1 + w_x)) * (Dx / (a**2 *h)) - (phi / (a**2 * h))
+        
+        dDmda = (9 / 2) * h * Omega_x * (1 + w_x) * (Um - Ux) + ((l**2 * Um) / (a**2 * h)) \
+              + (3/a)*(Um - Ux)*(1 -(Qm0/3/h))*(a*Qm0) + (Qm1/(a*h)) + ((dQ_mda*Um)/(a*h)) -((Qm0*Dm)/(a*h))
+                                                                                                                         
+        dDxda = (3 * w_x * Dx)/a + (9 / 2) * h * Omega_m * (1 + w_x) * (Ux - Um) \
+              + (1 + w_x) * ((l**2 * Ux) / (a**2 * h)) +(Qx1/(a*h)) \
+              + ((dQ_xda*Ux)/(a*h))-(1+(Csx/(1+w_x)))*((Qx0*Dx)/(a*h))
+        
+
+        return np.array([dh_da, domega_m_da, domega_x_da, dy_da, dx_da,dphida,dDmda,dumda,dDxda,duxda])
+    
+    if model =="LCDM":
+        return LCDM
+    elif model  in ["RP ","SUGRA ","DEpx"]:
+        return QCDM
+    else:
+        raise ValueError("Invalid models not CDM ")
+def a_stop (z):
+    return 1 / (1 + z)  # Convert redshift to scale factor
+
+# def _a(z):
+#     return 1 / (1 + z)
+
+def transfer_function(k, Omega_m0):
+    Omega_r = 9.24*1e-5
+    a_eq = Omega_r /Omega_m0
+    H_eq = (H0/c)*(np.sqrt((2*Omega_m0)/(a_eq)**3))
+    k_eq = a_eq* H_eq
+    s = k/k_eq
+    T = ((np.log(1+ 0.171*s))/(0.171*s))*((1+ 0.284*s+(1.18*s)**2+(0.399*s)**3+(0.490*s)**4))**(-0.25)
+    return T
+
+def phi_decp(k, transfer_function):
+    l = (k*c)/H0
+    # Growth factor D1
+    D1 = (5 / 2) * Omega_m0 * ((Omega_m0**(4 / 7) + (3 / 2) *Omega_m0 + (1 / 70) * Omega_x0 * (1 + (Omega_m0 / 2))))**-1
+  
+    # Initial conditions for perturbations
+    As = -((5 * np.sqrt(2) * np.pi * DH) / 3)  # Normalization factor
+    phi_p = As * (l)**((n - 1) / 2) * (Omega_m0 / D1)  # Primordial potential perturbation
+
+    # Transfer function
+    T = transfer_function(k, Omega_m0)
+
+    # Evolving potential perturbations
+    phi_decp = (9 / 10) * phi_p * T  # Dark matter dominated potential
+
+    return phi_decp
+
+def ICs( k, alpha, A0,etha, model):
+         
+    # Initial conditions function  
+    def ICs_LCDM():   
+        ICs_0 = np.array([h_0, Omega_m0, Omega_x0])  # initial conditions @a=1  
+        l = (k * c) / H0  
+        solu0 = solve_ivp(background, (a1[0], a1[-1]), ICs_0, t_eval=a1, args=(k,), rtol=1e-10, atol=1e-10)  
+        # Backward integration from a=1e-3 to a=1  
+        h_i, Omega_mi, Omega_xi = solu0.y[:, -1]  
+        phi_d = phi_decp(k, transfer_function)  
+        w_x = -1
+        # Growth factor D1  
+        D1 = (5 / 2) * Omega_m0 / ((Omega_m0**(4 / 7) + (3 / 2) * Omega_m0 + (1 / 70) * Omega_x0 * (1 + (Omega_m0 / 2)))) 
+        phi_i = (D1 / a0) * phi_d  # Initial condition  
+
+        R1 = -2 * (1 + w_m)  
+        R2 = 3 * ((ai * h_i) / l)**2 * (1 + Omega_m0 * w_m + Omega_x0 * w_x)  
+        Dm_i = (R1 / R2) * phi_d  
+        Um_i = -(2 / (3 * ai * h_i * (1 + Omega_x0 * w_x))) * phi_d  
+         
+        return np.array([h_i, Omega_mi, Omega_xi, phi_i, Dm_i, Um_i]) 
+    
+    def ICs_QCDM():
+        Omega_xi = 1e-8  # Omega_s + Omega_u
+        Omega_mi = 1 - Omega_xi
+        Omega_ui = Omega_xi / 2
+        l = (k * c) / H0
+
+        hi = np.sqrt(Omega_m0 /(ai**3 * Omega_mi))
+        ui = 3 * hi**2 * Omega_ui
+    
+        xi = (A0 / (3 * hi**2 * Omega_ui))**(1 / alpha)
+
+        yi = np.sqrt(2 * ai**2 *ui)
+       
+        w_x = w_xeff(ai, hi, xi, yi, etha, 1, Model)
+        
+       # print(w_x)
+        w_m = w_meff(ai, hi, xi, yi, Omega_mi, Omega_xi, etha, 1, Model)
+        
+        phi_d = phi_decp(k, transfer_function)
+        # Growth factor D1
+        D1 = (5 / 2) * Omega_m0 * ((Omega_m0**(4 / 7) + (3 / 2) * Omega_m0 + (1 / 70) * Omega_x0 * (1 + (Omega_m0 / 2))))**-1
+        phi_i = (D1 / a0) * phi_d     # Initial condition
+    
+        R1 = -2*(1 + w_m)
+        R2 = 3 * ((ai*hi)/l)**2*(1 + Omega_m0 * w_m + Omega_x0 * w_x)
+    
+        Dm_i = (R1 / R2) * phi_d
+        um_i = -(2 / (3*ai*hi*(1+Omega_x0*w_x))) * phi_d
+        Dx_i = (Dm_i/(1+w_m)) * (1 + w_x)
+        ux_i = um_i
+        return np.array([hi, Omega_mi, Omega_xi, yi, xi,phi_i,Dm_i,um_i,Dx_i,ux_i])
+    
+    if model == "LCDM":
+        return ICs_LCDM()
+    elif model in "RP SUGRA DExp":
+        return ICs_QCDM()
+    else:
+        raise ValueError("Invalid models not CDM ")
+
+def solve_a(aStop,k, model,alpha, A0, etha,rtol=1e-8, method="LSODA",atol=1e-8,t_vals=None):
+    ICs_values = ICs( k, alpha, A0, Model)
+    od = ODEs( k, etha, alpha, Model)
+    solu1 = solve_ivp(od, (ai, aStop), ICs_values, method=method, t_vals=t_vals, rtol=rtol, atol= atol) # 1e-10
+    #return  solu1
+    if model =="LCDM":
+        h, Omega_m, Omega_x, phi, Dm, Um = solu1.y
+        w_x = - np.ones(len(h))
+
+        Ux = Dx = zeros(len(h))         # the same len as the h or  \omega_m
+        a = solu1.t
+        return  a, h, Omega_m, Omega_x, phi, Dm, Um, Dx, Ux, w_x
+    
+    elif model in "RP SUGRA DExp":
+        h, Omega_m, Omega_x, y, x, phi, Dm, Um, Dx, Ux = solu1.y
+        a = solu1.t
+        w_x = w_q(a, x, y, Model, alpha)
+
+        return a, h, Omega_m, Omega_x, phi, Dm, Um, Dx, Ux, w_x
+    
+def generate_matched_filenames(model, zs_list, etha_list, alpha_dict, A0,A1,A2):
+    alpha_list = alpha_dict[model]
+    if len(alpha_list) != len(etha_list):
+        raise ValueError(f"alpha_list and etha_list must have the same length for {model}")
+
+    filenames = []
+
+    for zs in zs_list:
+        for alpha, etha in zip(alpha_list, etha_list):
+            if model == "LCDM":
+                params = {}  # LCDM has no additional parameters
+            elif model == "RP":
+                params = {"A0": A0, "alpha": alpha}
+            elif model == "SUGRA":
+                params = {"A1": A1, "alpha1": alpha}
+            elif model == "DEXP":
+                params = {"A2": A2, "alpha2": alpha, "Gamma": 0.55, "beta": 2.5}
+            else:
+                raise ValueError(f"Unknown model: {model}")
+
+            param = "_".join([f"{key}{value:.4f}" for key, value in params.items()]) if params else ""
+
+            filename = f"results_zs{zs:.4f}_etha{etha:.4f}_A{A0:.4f}"
+            if param:
+                filename += f"_{param}"
+            filename += f"_{model}"
+
+            filenames.append(filename)
+
+    return filenames
+
+# Different alpha values for each model
+alpha_dict = {
+    "RP": [0.5, 0.619347, 0.773002, 0.9297331],
+    "SUGRA": [0.6, 0.7, 0.8, 0.9],
+    "DEXP": [1.0, 1.2, 1.5, 1.7]
+}
+#A = {"RP": 1.632099,"SUGRA":1.3577636,"DExp":0.65347040}
+zs_list = [0, 0.5, 1, 3, 4]
+etha_list = [0, 0.1, 0.3, 0.5]
+
+for model in alpha_dict.keys():
+    matched_filenames = generate_matched_filenames(model, zs_list, etha_list, alpha_dict, A0, A1, A2)
+    #print(f"{model} Filenames (First 4):", matched_filenames[:4])
+
+def solve_k(a, model, alpha, etha, A0, k_max=1, k_vals=10, method="LSODA", t_vals=None, atol=1e-8, rtol=1e-8,Filename = None):
+    ks = np.linspace(1e-4, k_max, k_vals)
+    results = []
+
+    for k in ks:
+        sol = solve_a(a, k, Model, alpha, A0, etha)
+        results.append([k, *np.array(sol)[1:, -1]])
+    solu1 = np.array(results)
+    Filename = generate_matched_filenames(model, zs_list, etha_list, alpha_dict, A0, A1, A2)
+
+    with h5py.File("solve_k.h5", "a") as f:
+        f.create_dataset(Filename, data=solu1)
+
+    return solu1.T
+import h5py
+
+
+with h5py.File("solve_k.h5", "r") as f:
+    print("solve_k.h5:")
+    for name in f.keys():
+        print(name)
